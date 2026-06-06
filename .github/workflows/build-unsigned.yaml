@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-android:
-    name: Build Android APK
+    name: Build Android APK (unsigned)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -19,6 +19,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24.0'
+          cache-dependency-path: core/go.sum
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -37,22 +38,23 @@ jobs:
       - name: Get Flutter Dependencies
         run: flutter pub get
 
-      - name: Build Android APK (debug)
-        run: |
-          # Build with debug mode to avoid signing requirement
-          flutter build apk --debug --split-per-abi
+      - name: Build Android APK
+        run: dart setup.dart android -v
 
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
           name: artifact-android
-          path: build/app/outputs/flutter-apk/*.apk
+          path: ./dist/*
           overwrite: true
 
   build-windows:
-    name: Build Windows Installer
+    name: Build Windows Installer (unsigned)
     runs-on: windows-2022
     steps:
+      - name: Enable git long paths
+        run: git config --global core.longpaths true
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -62,9 +64,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24.0'
-
-      - name: Enable git long paths
-        run: git config --global core.longpaths true
+          cache-dependency-path: core/go.sum
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -78,8 +78,6 @@ jobs:
 
       - name: Build Windows
         run: dart setup.dart windows -v
-        env:
-          ANDROID_ARCH: ""
 
       - name: Upload Windows Build
         uses: actions/upload-artifact@v4
@@ -107,12 +105,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ./dist/*
-          name: Release ${{ github.ref_name }}
+          name: FlClash ${{ github.ref_name }}
           body: |
             ## FlClash with Speed Test Ranking
 
-            Automated build with speed test ranking feature:
-            - Android APK (debug, unsigned)
+            Automated build includes:
+            - Android APK (unsigned debug, .dev suffix)
             - Windows installer
-            
-            See https://github.com/cc9527-1/FlClash for source code.
+
+            New feature: Speed Test Ranking (download speed test via Clash proxy)
