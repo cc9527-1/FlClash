@@ -540,8 +540,8 @@
   "suspended": "Suspended...",
   "speedRank": "Speed Ranking",
   "startSpeedTest": "Start Speed Test",
-  "sortByDelay": "Sort by Delay",
+  "sortBySpeed": "Sort by Speed",
   "sortByName": "Sort by Name",
-  "noSpeedTestResults": "No speed test results. Start a test to see results.",
+  "noSpeedTestResults": "No speed test results. Start a download test.",
   "untested": "Untested"
 }

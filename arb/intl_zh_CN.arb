@@ -540,8 +540,8 @@
   "suspended": "挂起中...",
   "speedRank": "测速排名",
   "startSpeedTest": "开始测速",
-  "sortByDelay": "按延迟排序",
+  "sortBySpeed": "按速度排序",
   "sortByName": "按名称排序",
-  "noSpeedTestResults": "暂无测速结果，点击下方按钮开始测速",
+  "noSpeedTestResults": "暂无测速结果，点击下方按钮开始下载测速",
   "untested": "未测速"
 }

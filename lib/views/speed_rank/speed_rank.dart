@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:fl_clash/common/common.dart';
 import 'package:fl_clash/enum/enum.dart';
 import 'package:fl_clash/models/models.dart';
@@ -7,6 +9,15 @@ import 'package:fl_clash/views/proxies/common.dart';
 import 'package:fl_clash/widgets/widgets.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+/// Test file size for download speed measurement (5MB by default).
+/// Can be adjusted to smaller values for faster tests.
+const _defaultTestFileSize = 5 * 1024 * 1024; // 5MB
+
+/// Default download test URL template.
+/// {size} will be replaced with the actual byte count.
+const _defaultSpeedTestUrl =
+    'https://speed.cloudflare.com/__down?bytes={size}';
 
 class SpeedRankView extends ConsumerStatefulWidget {
   const SpeedRankView({super.key});
@@ -19,18 +30,26 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
   bool _isTesting = false;
   int _testedCount = 0;
   int _totalCount = 0;
-  Map<String, int> _results = {};
+
+  /// Maps proxy name -> speed in MB/s (negative = timeout/error, 0 = pending)
+  Map<String, double> _results = {};
+
+  /// Maps proxy name -> set of group names containing this proxy
   Map<String, Set<String>> _proxyGroups = {};
-  bool _sortByDelay = true;
+
+  /// Sort mode: true = by speed (fastest first), false = by name
+  bool _sortBySpeed = true;
+
   List<Proxy>? _allProxies;
 
-  List<MapEntry<String, int>> get _sortedResults {
+  /// Sorted results: fastest first (descending MB/s), timeout/errors at bottom
+  List<MapEntry<String, double>> get _sortedResults {
     final entries = _results.entries.toList();
-    if (_sortByDelay) {
+    if (_sortBySpeed) {
       entries.sort((a, b) {
         final aIsOk = a.value > 0;
         final bIsOk = b.value > 0;
-        if (aIsOk && bIsOk) return a.value.compareTo(b.value);
+        if (aIsOk && bIsOk) return b.value.compareTo(a.value); // descending
         if (aIsOk && !bIsOk) return -1;
         if (!aIsOk && bIsOk) return 1;
         return 0;
@@ -60,10 +79,106 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
     _allProxies = result;
   }
 
-  Future<void> _startSpeedTest() async {
+  /// Find the best group to use for switching to [proxyName].
+  /// Prefers Selector type groups, then any non-computed group.
+  String? _findGroupForProxy(String proxyName) {
+    final groups = getGroups();
+    // Prefer Selector groups (user can freely select any proxy)
+    for (final group in groups) {
+      if (group.type == GroupType.Selector &&
+          group.all.any((p) => p.name == proxyName)) {
+        return group.name;
+      }
+    }
+    // Fallback to any group containing this proxy
+    for (final group in groups) {
+      if (group.all.any((p) => p.name == proxyName)) {
+        return group.name;
+      }
+    }
+    return null;
+  }
+
+  /// Perform a download speed test for a single proxy.
+  /// Returns MB/s or -1 on failure.
+  Future<double> _testProxyDownloadSpeed(
+    String proxyName,
+    String groupName,
+    int proxyPort,
+    String speedTestUrl,
+  ) async {
+    try {
+      final ref = globalState.container;
+
+      // 1. Save current selection
+      final originalProxyName = ref.read(
+        selectedMapProvider.select((state) => state[groupName]),
+      );
+
+      // 2. Switch to target proxy
+      await coreController.changeProxy(
+        ChangeProxyParams(groupName: groupName, proxyName: proxyName),
+      );
+      // Give the core a moment to update routing
+      await Future.delayed(const Duration(milliseconds: 300));
+
+      // 3. Download test file through the local Clash HTTP proxy
+      final client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 15);
+      client.findProxy = (uri) => 'PROXY 127.0.0.1:$proxyPort';
+
+      final stopwatch = Stopwatch()..start();
+      final request = await client.getUrl(Uri.parse(speedTestUrl));
+      final response = await request.close();
+
+      int totalBytes = 0;
+      await for (final chunk in response) {
+        totalBytes += chunk.length;
+      }
+      stopwatch.stop();
+      client.close();
+
+      // 4. Restore original selection
+      if (originalProxyName != null && originalProxyName != proxyName) {
+        await coreController.changeProxy(
+          ChangeProxyParams(groupName: groupName, proxyName: originalProxyName),
+        );
+      }
+
+      // 5. Calculate speed
+      final elapsedSec = stopwatch.elapsedMilliseconds / 1000.0;
+      if (elapsedSec <= 0 || totalBytes <= 0) return -1;
+
+      return (totalBytes / (1024 * 1024)) / elapsedSec; // MB/s
+    } catch (e) {
+      return -1; // timeout or error
+    }
+  }
+
+  Future<void> _startDownloadSpeedTest() async {
     _collectAllProxiesAndGroups();
     final proxies = _allProxies;
     if (proxies == null || proxies.isEmpty) return;
+
+    final ref = globalState.container;
+    final mixedPort = ref.read(
+      patchClashConfigProvider.select((state) => state.mixedPort),
+    );
+    if (mixedPort == null || mixedPort <= 0) {
+      if (mounted) {
+        globalState.showMessage(
+          title: 'Error',
+          message: const TextSpan(
+            text: 'Proxy port not available. Please start the service first.',
+          ),
+        );
+      }
+      return;
+    }
+
+    // Build speed test URL with a 5MB file
+    final speedTestUrl =
+        _defaultSpeedTestUrl.replaceAll('{size}', '$_defaultTestFileSize');
 
     setState(() {
       _isTesting = true;
@@ -72,61 +187,46 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
       _results = {};
     });
 
-    final ref = globalState.container;
-    final defaultTestUrl = ref.read(realTestUrlProvider(null));
-
-    // Batch test proxies in groups of 50 for concurrency control
-    final batches = _batch(proxies, 50);
-    for (final batch in batches) {
-      await Future.wait(batch.map((proxy) async {
-        await proxyDelayTest(proxy, null);
-        setState(() {
-          _testedCount++;
-        });
-
-        // Read delay result from the data source
-        final delayMap = ref.read(delayDataSourceProvider);
-        final groups = getGroups();
-        final selectedMap = ref.read(
-          currentProfileProvider.select((state) => state?.selectedMap ?? {}),
-        );
-        final state = computeRealSelectedProxyState(
-          proxy.name,
-          groups: groups,
-          selectedMap: selectedMap,
-        );
-        final effectiveTestUrl =
-            state.testUrl.takeFirstValid([defaultTestUrl]);
-        final delay = delayMap[effectiveTestUrl]?[state.proxyName];
-
+    // Process sequentially (not parallel) to avoid overwhelming the proxy
+    for (final proxy in proxies) {
+      final groupName = _findGroupForProxy(proxy.name);
+      if (groupName == null) {
         if (mounted) {
           setState(() {
-            _results[proxy.name] = delay ?? -1;
+            _results[proxy.name] = -1;
+            _testedCount++;
           });
         }
-      }));
-    }
+        continue;
+      }
 
-    ref.read(sortNumProvider.notifier).add();
+      // Show "testing" state
+      if (mounted) {
+        setState(() {
+          _results[proxy.name] = 0; // 0 = currently testing
+        });
+      }
+
+      final speed = await _testProxyDownloadSpeed(
+        proxy.name,
+        groupName,
+        mixedPort,
+        speedTestUrl,
+      );
+
+      if (mounted) {
+        setState(() {
+          _results[proxy.name] = speed;
+          _testedCount++;
+        });
+      }
+    }
 
     if (mounted) {
       setState(() {
         _isTesting = false;
       });
     }
-  }
-
-  List<List<T>> _batch<T>(List<T> items, int size) {
-    final batches = <List<T>>[];
-    for (var i = 0; i < items.length; i += size) {
-      batches.add(
-        items.sublist(
-          i,
-          i + size > items.length ? items.length : i + size,
-        ),
-      );
-    }
-    return batches;
   }
 
   @override
@@ -140,33 +240,25 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
 
     final okCount = sortedResults.where((e) => e.value > 0).length;
     final timeoutCount = sortedResults.where((e) => e.value < 0).length;
-    final untestedCount = sortedResults.where((e) => e.value == 0).length;
+    final testingCount = sortedResults.where((e) => e.value == 0).length;
 
     return CommonScaffold(
-      title: Text(
-        Intl.message('speedRank'),
-      ),
+      title: Text(Intl.message('speedRank')),
       floatingActionButton: _isTesting
           ? null
           : FloatingActionButton.extended(
-              onPressed: _startSpeedTest,
+              onPressed: _startDownloadSpeedTest,
               icon: const Icon(Icons.speed),
-              label: Text(
-                Intl.message('startSpeedTest'),
-              ),
+              label: Text(Intl.message('startSpeedTest')),
             ),
       body: Column(
         children: [
           // Progress section
           if (_isTesting) ...[
             Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 8,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               child: LinearProgressIndicator(
-                value:
-                    _totalCount > 0 ? _testedCount / _totalCount : 0,
+                value: _totalCount > 0 ? _testedCount / _totalCount : 0,
               ),
             ),
             Padding(
@@ -179,28 +271,21 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
           ],
           // Sort toggles
           Padding(
-            padding: const EdgeInsets.symmetric(
-              horizontal: 16,
-              vertical: 4,
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
             child: Row(
               children: [
                 _buildSortChip(
                   context,
-                  Intl.message('sortByDelay'),
-                  _sortByDelay,
-                  () {
-                    setState(() => _sortByDelay = true);
-                  },
+                  Intl.message('sortBySpeed'),
+                  _sortBySpeed,
+                  () => setState(() => _sortBySpeed = true),
                 ),
                 const SizedBox(width: 8),
                 _buildSortChip(
                   context,
                   Intl.message('sortByName'),
-                  !_sortByDelay,
-                  () {
-                    setState(() => _sortByDelay = false);
-                  },
+                  !_sortBySpeed,
+                  () => setState(() => _sortBySpeed = false),
                 ),
               ],
             ),
@@ -208,10 +293,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
           // Stats summary
           if (sortedResults.isNotEmpty)
             Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 4,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
               child: SizedBox(
                 height: measure.bodySmallHeight,
                 child: Row(
@@ -236,13 +318,13 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
                       Intl.message('timeout'),
                       Colors.red.shade300,
                     ),
-                    if (untestedCount > 0) ...[
+                    if (testingCount > 0) ...[
                       const SizedBox(width: 8),
                       _buildStatChip(
                         context,
-                        '$untestedCount',
-                        Intl.message('untested'),
-                        Colors.grey,
+                        '$testingCount',
+                        Intl.message('testing'),
+                        Colors.orange,
                       ),
                     ],
                   ],
@@ -264,17 +346,13 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
                         const Divider(height: 0, indent: 72),
                     itemBuilder: (_, index) {
                       final entry = sortedResults[index];
-                      final delay = entry.value;
+                      final speed = entry.value;
                       final groups = _proxyGroups[entry.key] ?? {};
-                      final delayColor = utils.getDelayColor(
-                        delay > 0 ? delay : null,
-                      );
 
                       return ListTile(
                         dense: true,
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                        ),
+                        contentPadding:
+                            const EdgeInsets.symmetric(horizontal: 8),
                         leading: SizedBox(
                           width: 40,
                           child: Center(
@@ -297,7 +375,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
                                 ?.withValues(alpha: 0.7),
                           ),
                         ),
-                        trailing: _buildDelayWidget(delay, delayColor),
+                        trailing: _buildSpeedWidget(speed),
                       );
                     },
                   ),
@@ -312,7 +390,11 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
     Color bgColor;
     Color fgColor;
     if (isTop3) {
-      const topColors = [Color(0xFFFFD700), Color(0xFFC0C0C0), Color(0xFFCD7F32)];
+      const topColors = [
+        Color(0xFFFFD700),
+        Color(0xFFC0C0C0),
+        Color(0xFFCD7F32),
+      ];
       bgColor = topColors[index];
       fgColor = Colors.black87;
     } else {
@@ -347,10 +429,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
     VoidCallback onSelected,
   ) {
     return FilterChip(
-      label: Text(
-        label,
-        style: context.textTheme.labelMedium,
-      ),
+      label: Text(label, style: context.textTheme.labelMedium),
       selected: selected,
       onSelected: (_) => onSelected(),
       visualDensity: VisualDensity.compact,
@@ -388,28 +467,44 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
           const SizedBox(width: 4),
           Text(
             label,
-            style: TextStyle(
-              fontSize: 11,
-              color: color?.withValues(alpha: 0.8),
-            ),
+            style: TextStyle(fontSize: 11, color: color?.withValues(alpha: 0.8)),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildDelayWidget(int delay, Color? color) {
-    if (delay > 0) {
+  /// Build the speed display widget for a proxy row.
+  /// Shows MB/s with appropriate color coding.
+  Widget _buildSpeedWidget(double speed) {
+    if (speed > 0) {
+      // Format speed: if >= 1, show as X.XX MB/s; if < 1, show as XXX KB/s
+      String displayText;
+      Color displayColor;
+
+      if (speed >= 1.0) {
+        displayText = '${speed.toStringAsFixed(2)} MB/s';
+        displayColor = speed >= 5.0
+            ? Colors.green
+            : speed >= 1.0
+                ? Colors.orange
+                : Colors.red;
+      } else {
+        final kbSpeed = (speed * 1024).toStringAsFixed(0);
+        displayText = '$kbSpeed KB/s';
+        displayColor = Colors.red;
+      }
+
       return Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
-          color: color?.withValues(alpha: 0.15),
+          color: displayColor.withValues(alpha: 0.15),
           borderRadius: BorderRadius.circular(6),
         ),
         child: Text(
-          '$delay ms',
+          displayText,
           style: TextStyle(
-            color: color,
+            color: displayColor,
             fontWeight: FontWeight.w600,
             fontFamily: FontFamily.jetBrainsMono.value,
             fontSize: 13,
@@ -417,7 +512,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
         ),
       );
     }
-    if (delay == 0) {
+    if (speed == 0) {
       return const SizedBox(
         width: 18,
         height: 18,
