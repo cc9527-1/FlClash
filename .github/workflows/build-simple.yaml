@@ -1,0 +1,137 @@
+name: build-simple
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.0'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.41.9
+          cache: true
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Create dummy google-services.json
+        run: |
+          mkdir -p android/app
+          echo '{"project_info":{"project_number":"0","project_id":"dummy","storage_bucket":"dummy"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:android:abc","android_client_info":{"package_name":"com.follow.clash"}},"oauth_client":[],"api_key":[{"current_key":"dummy"}],"services":{"analytics_service":{"status":1},"appinvite_service":{"status":1},"ads_service":{"status":1}}}]}' > android/app/google-services.json
+
+      - name: Get Flutter Dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+      - name: Build Android APK
+        run: flutter build apk --release --split-per-abi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: build/app/outputs/flutter-apk/*.apk
+
+  build-windows:
+    name: Build Windows EXE
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.0'
+
+      - name: Enable git long paths
+        run: git config --global core.longpaths true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.41.9
+          cache: true
+
+      - name: Get Flutter Dependencies
+        run: flutter pub get
+
+      - name: Build Windows EXE
+        run: flutter build windows --release
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: build/windows/runner/Release/
+
+  create-release:
+    needs: [build-android, build-windows]
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./dist/
+          pattern: "*"
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          cd ./dist
+          mkdir -p ../release
+          for f in *.apk; do
+            if [ -f "$f" ]; then
+              cp "$f" ../release/
+              echo "Added: $f"
+            fi
+          done
+          # Zip the Windows build
+          if [ -d "Release" ]; then
+            cd Release
+            7z a ../windows-build.zip *
+            cd ..
+          fi
+          ls -la ../release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./release/*
+          name: FlClash ${{ github.ref_name }}
+          body: |
+            ## FlClash with Speed Test Ranking
+
+            **Features added:**
+            - Speed Test Ranking page (download speed test via Clash proxy)
+            - Tests each proxy node and ranks by download speed (MB/s)
+            - Real-time progress tracking
+            - Sorted display: fastest first
+
+            **Note:** Debug build (.dev suffix), unsigned APK.

@@ -6,8 +6,8 @@ on:
       - 'v*'
 
 jobs:
-  build-android:
-    name: Build Android APK (unsigned)
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -15,11 +15,58 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.41.9
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+      - name: Run tests
+        run: flutter test --reporter expanded
+
+  build:
+    needs: [ test ]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            os: ubuntu-latest
+          - platform: windows
+            os: windows-2022
+            arch: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Create dummy Firebase config files (no signing keys available)
+      - name: Create dummy Firebase config
+        if: startsWith(matrix.platform,'android')
+        shell: bash
+        run: |
+          echo '{"project_info":{"project_number":"0","project_id":"dummy","storage_bucket":"dummy"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:android:abc","android_client_info":{"package_name":"com.follow.clash"}},"oauth_client":[],"api_key":[{"current_key":"dummy"}],"services":{"analytics_service":{"status":1},"appinvite_service":{"status":1},"ads_service":{"status":1}}}]}' > android/app/google-services.json
+          touch android/app/keystore.jks
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.24.0'
           cache-dependency-path: core/go.sum
+
+      - name: Enable git long paths (Windows)
+        if: startsWith(matrix.os, 'windows')
+        run: git config --global core.longpaths true
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -29,69 +76,37 @@ jobs:
           cache: true
 
       - name: Setup NDK
+        if: startsWith(matrix.platform,'android')
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r28c
           add-to-path: true
           link-to-sdk: true
 
-      - name: Get Flutter Dependencies
-        run: flutter pub get
+      - name: Get Flutter Dependency
+        run: |
+          flutter --version
+          flutter pub get
 
-      - name: Build Android APK
-        run: dart setup.dart android -v
+      - name: Setup & Build
+        run: dart setup.dart ${{ matrix.platform }} -v
+        shell: bash
+        env:
+          ANDROID_ARCH: ""
 
-      - name: Upload Android APK
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: artifact-android
-          path: ./dist/*
-          overwrite: true
-
-  build-windows:
-    name: Build Windows Installer (unsigned)
-    runs-on: windows-2022
-    steps:
-      - name: Enable git long paths
-        run: git config --global core.longpaths true
-
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24.0'
-          cache-dependency-path: core/go.sum
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          flutter-version: 3.41.9
-          cache: true
-
-      - name: Get Flutter Dependencies
-        run: flutter pub get
-
-      - name: Build Windows
-        run: dart setup.dart windows -v
-
-      - name: Upload Windows Build
-        uses: actions/upload-artifact@v4
-        with:
-          name: artifact-windows
-          path: ./dist/*
+          name: artifact-${{ matrix.platform }}${{ matrix.arch && format('-{0}', matrix.arch) || '' }}
+          path: ./dist
           overwrite: true
 
   create-release:
-    needs: [build-android, build-windows]
+    needs: [ build ]
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
-      - name: Download All Artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: ./dist/
@@ -109,8 +124,9 @@ jobs:
           body: |
             ## FlClash with Speed Test Ranking
 
-            Automated build includes:
-            - Android APK (unsigned debug, .dev suffix)
-            - Windows installer
+            **New Feature:**
+            - Speed Test Ranking page
+            - Download speed test for each proxy node (via Clash proxy)
+            - Auto-rank by speed (fastest first)
 
-            New feature: Speed Test Ranking (download speed test via Clash proxy)
+            **Note:** Unsigned debug build (.dev suffix for Android)
