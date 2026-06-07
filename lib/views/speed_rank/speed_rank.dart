@@ -109,26 +109,26 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
     int proxyPort,
     String speedTestUrl,
   ) async {
+    final ref = globalState.container;
+
+    // 1. Save current selection
+    final originalProxyName = ref.read(
+      selectedMapProvider.select((state) => state[groupName]),
+    );
+
+    // 2. Switch to target proxy
+    await coreController.changeProxy(
+      ChangeProxyParams(groupName: groupName, proxyName: proxyName),
+    );
+    // Give the core a moment to update routing
+    await Future.delayed(const Duration(milliseconds: 300));
+
+    // 3. Download test file through the local Clash HTTP proxy
+    final client = HttpClient();
+    client.connectionTimeout = const Duration(seconds: 15);
+    client.findProxy = (uri) => 'PROXY 127.0.0.1:$proxyPort';
+
     try {
-      final ref = globalState.container;
-
-      // 1. Save current selection
-      final originalProxyName = ref.read(
-        selectedMapProvider.select((state) => state[groupName]),
-      );
-
-      // 2. Switch to target proxy
-      await coreController.changeProxy(
-        ChangeProxyParams(groupName: groupName, proxyName: proxyName),
-      );
-      // Give the core a moment to update routing
-      await Future.delayed(const Duration(milliseconds: 300));
-
-      // 3. Download test file through the local Clash HTTP proxy
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 15);
-      client.findProxy = (uri) => 'PROXY 127.0.0.1:$proxyPort';
-
       final stopwatch = Stopwatch()..start();
       final request = await client.getUrl(Uri.parse(speedTestUrl));
       final response = await request.close();
@@ -138,22 +138,26 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
         totalBytes += chunk.length;
       }
       stopwatch.stop();
-      client.close();
 
-      // 4. Restore original selection
-      if (originalProxyName != null && originalProxyName != proxyName) {
-        await coreController.changeProxy(
-          ChangeProxyParams(groupName: groupName, proxyName: originalProxyName),
-        );
-      }
-
-      // 5. Calculate speed
+      // 4. Calculate speed
       final elapsedSec = stopwatch.elapsedMilliseconds / 1000.0;
       if (elapsedSec <= 0 || totalBytes <= 0) return -1;
 
       return (totalBytes / (1024 * 1024)) / elapsedSec; // MB/s
     } catch (e) {
       return -1; // timeout or error
+    } finally {
+      client.close();
+      // 5. Restore original selection
+      if (originalProxyName != null && originalProxyName != proxyName) {
+        await coreController.changeProxy(
+          ChangeProxyParams(
+            groupName: groupName,
+            proxyName: originalProxyName,
+          ),
+        );
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
     }
   }
 
