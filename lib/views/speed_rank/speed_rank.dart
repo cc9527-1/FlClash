@@ -9,6 +9,7 @@ import 'package:fl_clash/views/proxies/common.dart';
 import 'package:fl_clash/widgets/widgets.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
 
 /// Test file size for download speed measurement (5MB by default).
 /// Can be adjusted to smaller values for faster tests.
@@ -243,7 +244,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
     final testingCount = sortedResults.where((e) => e.value == 0).length;
 
     return CommonScaffold(
-      title: Text(Intl.message('speedRank')),
+      title: Intl.message('speedRank'),
       floatingActionButton: _isTesting
           ? null
           : FloatingActionButton.extended(
