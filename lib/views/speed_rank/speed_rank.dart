@@ -13,11 +13,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 /// Test file size for download speed measurement (5MB by default).
-/// Can be adjusted to smaller values for faster tests.
-const _defaultTestFileSize = 5 * 1024 * 1024; // 5MB
+const _defaultTestFileSize = 5 * 1024 * 1024;
 
 /// Default download test URL template.
-/// {size} will be replaced with the actual byte count.
 const _defaultSpeedTestUrl =
     'https://speed.cloudflare.com/__down?bytes={size}';
 
@@ -39,19 +37,23 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
   /// Maps proxy name -> set of group names containing this proxy
   Map<String, Set<String>> _proxyGroups = {};
 
-  /// Sort mode: true = by speed (fastest first), false = by name
+  /// Sort mode: true = by speed, false = by name
   bool _sortBySpeed = true;
 
   List<Proxy>? _allProxies;
 
-  /// Sorted results: fastest first (descending MB/s), timeout/errors at bottom
+  /// System/internal proxy names excluded from speed tests.
+  static const _systemProxies = <String>{
+    'DIRECT', 'REJECT', 'GLOBAL', 'COMPATIBLE', 'PASS', 'REJECT-DROP',
+  };
+
   List<MapEntry<String, double>> get _sortedResults {
     final entries = _results.entries.toList();
     if (_sortBySpeed) {
       entries.sort((a, b) {
         final aIsOk = a.value > 0;
         final bIsOk = b.value > 0;
-        if (aIsOk && bIsOk) return b.value.compareTo(a.value); // descending
+        if (aIsOk && bIsOk) return b.value.compareTo(a.value);
         if (aIsOk && !bIsOk) return -1;
         if (!aIsOk && bIsOk) return 1;
         return 0;
@@ -70,6 +72,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
 
     for (final group in groups) {
       for (final proxy in group.all) {
+        if (_systemProxies.contains(proxy.name)) continue;
         proxyGroups.putIfAbsent(proxy.name, () => {}).add(group.name);
         if (proxyNameSet.add(proxy.name)) {
           result.add(proxy);
@@ -81,28 +84,40 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
     _allProxies = result;
   }
 
-  /// Find the best group to use for switching to [proxyName].
-  /// Prefers Selector type groups, then any non-computed group.
+  /// Find a Selector group containing [proxyName].
+  /// Only Selector groups support manual proxy switching via changeProxy.
+  /// Returns null if no Selector group contains this proxy (e.g. URL-test group).
   String? _findGroupForProxy(String proxyName) {
     final groups = getGroups();
-    // Prefer Selector groups (user can freely select any proxy)
     for (final group in groups) {
       if (group.type == GroupType.Selector &&
           group.all.any((p) => p.name == proxyName)) {
         return group.name;
       }
     }
-    // Fallback to any group containing this proxy
-    for (final group in groups) {
-      if (group.all.any((p) => p.name == proxyName)) {
-        return group.name;
-      }
-    }
     return null;
   }
 
-  /// Perform a download speed test for a single proxy.
-  /// Returns MB/s or -1 on failure.
+  /// Get existing delay data for [proxyName] as a fallback indicator.
+  int? _getExistingDelay(String proxyName) {
+    final ref = globalState.container;
+    final delayMap = ref.read(delayDataSourceProvider);
+    final defaultTestUrl = ref.read(realTestUrlProvider(null));
+    final groups = getGroups();
+    final selectedMap = ref.read(
+      currentProfileProvider.select((state) => state?.selectedMap ?? {}),
+    );
+    final state = computeRealSelectedProxyState(
+      proxyName,
+      groups: groups,
+      selectedMap: selectedMap,
+    );
+    if (state.proxyName.isEmpty) return null;
+    final testUrl = state.testUrl.takeFirstValid([defaultTestUrl]);
+    return delayMap[testUrl]?[state.proxyName];
+  }
+
+  /// Download speed test for a single proxy via the Clash HTTP proxy.
   Future<double> _testProxyDownloadSpeed(
     String proxyName,
     String groupName,
@@ -110,20 +125,15 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
     String speedTestUrl,
   ) async {
     final ref = globalState.container;
-
-    // 1. Save current selection
     final originalProxyName = ref.read(
       selectedMapProvider.select((state) => state[groupName]),
     );
 
-    // 2. Switch to target proxy
     await coreController.changeProxy(
       ChangeProxyParams(groupName: groupName, proxyName: proxyName),
     );
-    // Give the core a moment to update routing
     await Future.delayed(const Duration(milliseconds: 300));
 
-    // 3. Download test file through the local Clash HTTP proxy
     final client = HttpClient();
     client.connectionTimeout = const Duration(seconds: 15);
     client.findProxy = (uri) => 'PROXY 127.0.0.1:$proxyPort';
@@ -139,22 +149,16 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
       }
       stopwatch.stop();
 
-      // 4. Calculate speed
       final elapsedSec = stopwatch.elapsedMilliseconds / 1000.0;
       if (elapsedSec <= 0 || totalBytes <= 0) return -1;
-
-      return (totalBytes / (1024 * 1024)) / elapsedSec; // MB/s
+      return (totalBytes / (1024 * 1024)) / elapsedSec;
     } catch (e) {
-      return -1; // timeout or error
+      return -1;
     } finally {
       client.close();
-      // 5. Restore original selection
       if (originalProxyName != null && originalProxyName != proxyName) {
         await coreController.changeProxy(
-          ChangeProxyParams(
-            groupName: groupName,
-            proxyName: originalProxyName,
-          ),
+          ChangeProxyParams(groupName: groupName, proxyName: originalProxyName),
         );
         await Future.delayed(const Duration(milliseconds: 100));
       }
@@ -170,7 +174,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
     final mixedPort = ref.read(
       patchClashConfigProvider.select((state) => state.mixedPort),
     );
-    if (mixedPort == null || mixedPort <= 0) {
+    if (mixedPort <= 0) {
       if (mounted) {
         globalState.showMessage(
           title: 'Error',
@@ -182,7 +186,6 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
       return;
     }
 
-    // Build speed test URL with a 5MB file
     final speedTestUrl =
         _defaultSpeedTestUrl.replaceAll('{size}', '$_defaultTestFileSize');
 
@@ -193,13 +196,17 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
       _results = {};
     });
 
-    // Process sequentially (not parallel) to avoid overwhelming the proxy
     for (final proxy in proxies) {
+      // Check if proxy is in a Selector group (download-testable)
       final groupName = _findGroupForProxy(proxy.name);
       if (groupName == null) {
+        // Not testable via download — use existing delay data as fallback
         if (mounted) {
+          final delay = _getExistingDelay(proxy.name);
           setState(() {
-            _results[proxy.name] = -1;
+            _results[proxy.name] = delay != null && delay > 0
+                ? -(delay.toDouble()) // negative = delay fallback
+                : -1;
             _testedCount++;
           });
         }
@@ -209,15 +216,12 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
       // Show "testing" state
       if (mounted) {
         setState(() {
-          _results[proxy.name] = 0; // 0 = currently testing
+          _results[proxy.name] = 0;
         });
       }
 
       final speed = await _testProxyDownloadSpeed(
-        proxy.name,
-        groupName,
-        mixedPort,
-        speedTestUrl,
+        proxy.name, groupName, mixedPort, speedTestUrl,
       );
 
       if (mounted) {
@@ -237,9 +241,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
 
   @override
   Widget build(BuildContext context) {
-    if (_allProxies == null) {
-      _collectAllProxiesAndGroups();
-    }
+    if (_allProxies == null) _collectAllProxiesAndGroups();
     final proxies = _allProxies ?? <Proxy>[];
     final sortedResults = _sortedResults;
     final measure = globalState.measure;
@@ -280,23 +282,15 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
             child: Row(
               children: [
-                _buildSortChip(
-                  context,
-                  Intl.message('sortBySpeed'),
-                  _sortBySpeed,
-                  () => setState(() => _sortBySpeed = true),
-                ),
+                _buildSortChip(context, Intl.message('sortBySpeed'),
+                    _sortBySpeed, () => setState(() => _sortBySpeed = true)),
                 const SizedBox(width: 8),
-                _buildSortChip(
-                  context,
-                  Intl.message('sortByName'),
-                  !_sortBySpeed,
-                  () => setState(() => _sortBySpeed = false),
-                ),
+                _buildSortChip(context, Intl.message('sortByName'),
+                    !_sortBySpeed, () => setState(() => _sortBySpeed = false)),
               ],
             ),
           ),
-          // Stats summary
+          // Stats
           if (sortedResults.isNotEmpty)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -304,40 +298,25 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
                 height: measure.bodySmallHeight,
                 child: Row(
                   children: [
-                    _buildStatChip(
-                      context,
-                      '${proxies.length}',
-                      Intl.message('total'),
-                      null,
-                    ),
+                    _buildStatChip(context, '${proxies.length}',
+                        Intl.message('total'), null),
                     const SizedBox(width: 8),
                     _buildStatChip(
-                      context,
-                      '$okCount',
-                      'OK',
-                      Colors.green,
-                    ),
+                        context, '$okCount', 'OK', Colors.green),
                     const SizedBox(width: 8),
                     _buildStatChip(
-                      context,
-                      '$timeoutCount',
-                      Intl.message('timeout'),
-                      Colors.red.shade300,
-                    ),
+                        context, '$timeoutCount', Intl.message('timeout'),
+                        Colors.red.shade300),
                     if (testingCount > 0) ...[
                       const SizedBox(width: 8),
-                      _buildStatChip(
-                        context,
-                        '$testingCount',
-                        Intl.message('testing'),
-                        Colors.orange,
-                      ),
+                      _buildStatChip(context, '$testingCount',
+                          Intl.message('testing'), Colors.orange),
                     ],
                   ],
                 ),
               ),
             ),
-          // Proxy ranking list
+          // Ranking list
           Expanded(
             child: sortedResults.isEmpty
                 ? Center(
@@ -354,33 +333,22 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
                       final entry = sortedResults[index];
                       final speed = entry.value;
                       final groups = _proxyGroups[entry.key] ?? {};
-
                       return ListTile(
                         dense: true,
                         contentPadding:
                             const EdgeInsets.symmetric(horizontal: 8),
                         leading: SizedBox(
                           width: 40,
-                          child: Center(
-                            child: _buildRankBadge(index),
-                          ),
+                          child: Center(child: _buildRankBadge(index)),
                         ),
-                        title: Text(
-                          entry.key,
-                          overflow: TextOverflow.ellipsis,
-                          maxLines: 1,
-                          style: context.textTheme.bodyMedium,
-                        ),
-                        subtitle: Text(
-                          groups.join(', '),
-                          overflow: TextOverflow.ellipsis,
-                          maxLines: 1,
-                          style: context.textTheme.bodySmall?.copyWith(
-                            color: context
-                                .textTheme.bodySmall?.color
-                                ?.withValues(alpha: 0.7),
-                          ),
-                        ),
+                        title: Text(entry.key,
+                            overflow: TextOverflow.ellipsis, maxLines: 1,
+                            style: context.textTheme.bodyMedium),
+                        subtitle: Text(groups.join(', '),
+                            overflow: TextOverflow.ellipsis, maxLines: 1,
+                            style: context.textTheme.bodySmall?.copyWith(
+                                color: context.textTheme.bodySmall?.color
+                                    ?.withValues(alpha: 0.7))),
                         trailing: _buildSpeedWidget(speed),
                       );
                     },
@@ -393,13 +361,10 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
 
   Widget _buildRankBadge(int index) {
     final isTop3 = index < 3;
-    Color bgColor;
-    Color fgColor;
+    Color bgColor, fgColor;
     if (isTop3) {
       const topColors = [
-        Color(0xFFFFD700),
-        Color(0xFFC0C0C0),
-        Color(0xFFCD7F32),
+        Color(0xFFFFD700), Color(0xFFC0C0C0), Color(0xFFCD7F32),
       ];
       bgColor = topColors[index];
       fgColor = Colors.black87;
@@ -407,10 +372,8 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
       bgColor = Colors.transparent;
       fgColor = Colors.grey;
     }
-
     return Container(
-      width: 28,
-      height: 28,
+      width: 28, height: 28,
       decoration: BoxDecoration(
         color: bgColor,
         borderRadius: BorderRadius.circular(isTop3 ? 14 : 4),
@@ -419,20 +382,15 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
       child: Text(
         '${index + 1}',
         style: TextStyle(
-          fontSize: isTop3 ? 13 : 12,
-          fontWeight: FontWeight.bold,
-          color: fgColor,
-          fontFamily: FontFamily.jetBrainsMono.value,
+          fontSize: isTop3 ? 13 : 12, fontWeight: FontWeight.bold,
+          color: fgColor, fontFamily: FontFamily.jetBrainsMono.value,
         ),
       ),
     );
   }
 
   Widget _buildSortChip(
-    BuildContext context,
-    String label,
-    bool selected,
-    VoidCallback onSelected,
+    BuildContext context, String label, bool selected, VoidCallback onSelected,
   ) {
     return FilterChip(
       label: Text(label, style: context.textTheme.labelMedium),
@@ -444,10 +402,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
   }
 
   Widget _buildStatChip(
-    BuildContext context,
-    String value,
-    String label,
-    Color? color,
+    BuildContext context, String value, String label, Color? color,
   ) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -461,68 +416,65 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.bold,
-              color: color,
-              fontFamily: FontFamily.jetBrainsMono.value,
-            ),
-          ),
+          Text(value,
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold,
+              color: color, fontFamily: FontFamily.jetBrainsMono.value)),
           const SizedBox(width: 4),
-          Text(
-            label,
-            style: TextStyle(fontSize: 11, color: color?.withValues(alpha: 0.8)),
-          ),
+          Text(label,
+            style: TextStyle(fontSize: 11,
+              color: color?.withValues(alpha: 0.8))),
         ],
       ),
     );
   }
 
-  /// Build the speed display widget for a proxy row.
-  /// Shows MB/s with appropriate color coding.
   Widget _buildSpeedWidget(double speed) {
     if (speed > 0) {
-      // Format speed: if >= 1, show as X.XX MB/s; if < 1, show as XXX KB/s
       String displayText;
       Color displayColor;
-
       if (speed >= 1.0) {
         displayText = '${speed.toStringAsFixed(2)} MB/s';
-        displayColor = speed >= 5.0
-            ? Colors.green
-            : speed >= 1.0
-                ? Colors.orange
-                : Colors.red;
+        displayColor = speed >= 5.0 ? Colors.green
+            : speed >= 1.0 ? Colors.orange : Colors.red;
       } else {
-        final kbSpeed = (speed * 1024).toStringAsFixed(0);
-        displayText = '$kbSpeed KB/s';
+        displayText = '${(speed * 1024).toStringAsFixed(0)} KB/s';
         displayColor = Colors.red;
       }
-
       return Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
           color: displayColor.withValues(alpha: 0.15),
           borderRadius: BorderRadius.circular(6),
         ),
-        child: Text(
-          displayText,
-          style: TextStyle(
-            color: displayColor,
+        child: Text(displayText,
+          style: TextStyle(color: displayColor,
             fontWeight: FontWeight.w600,
-            fontFamily: FontFamily.jetBrainsMono.value,
-            fontSize: 13,
-          ),
-        ),
+            fontFamily: FontFamily.jetBrainsMono.value, fontSize: 13)),
       );
     }
     if (speed == 0) {
       return const SizedBox(
-        width: 18,
-        height: 18,
+        width: 18, height: 18,
         child: CircularProgressIndicator(strokeWidth: 2),
+      );
+    }
+    // Negative value = delay-only fallback (show delay in ms)
+    // speed = -1 = pure timeout
+    if (speed < -0.5) {
+      final delayMs = (-speed).round();
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: Colors.blue.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Text(
+          '$delayMs ms',
+          style: TextStyle(
+            fontSize: 12, fontWeight: FontWeight.w500,
+            color: Colors.blue.shade300,
+          ),
+        ),
       );
     }
     return Container(
@@ -534,8 +486,7 @@ class _SpeedRankViewState extends ConsumerState<SpeedRankView> {
       child: Text(
         Intl.message('timeout'),
         style: TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w500,
+          fontSize: 12, fontWeight: FontWeight.w500,
           color: Colors.red.shade300,
         ),
       ),
