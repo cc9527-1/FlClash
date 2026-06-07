@@ -25,12 +25,19 @@ jobs:
           submodules: recursive
 
       # Create dummy Firebase config files (no signing keys available)
-      - name: Create dummy Firebase config
+      - name: Create dummy Firebase config & disable Firebase plugin
         if: startsWith(matrix.platform,'android')
         shell: bash
         run: |
           echo '{"project_info":{"project_number":"0","project_id":"dummy","storage_bucket":"dummy"},"client":[{"client_info":{"mobilesdk_app_id":"1:0:android:abc","android_client_info":{"package_name":"com.follow.clash"}},"oauth_client":[],"api_key":[{"current_key":"dummy"}],"services":{"analytics_service":{"status":1},"appinvite_service":{"status":1},"ads_service":{"status":1}}}]}' > android/app/google-services.json
           touch android/app/keystore.jks
+          # Remove Firebase Google Services plugin for unsigned builds
+          sed -i 's/id("com.google.gms.google-services")//' android/app/build.gradle.kts
+          sed -i 's/id("com.google.firebase.crashlytics")//' android/app/build.gradle.kts
+          sed -i 's/id("com.google.gms.google-services")//' android/build.gradle.kts
+          sed -i 's/implementation(platform(libs.firebase.bom))//' android/app/build.gradle.kts
+          sed -i 's/implementation(libs.firebase.crashlytics.ndk)//' android/app/build.gradle.kts
+          sed -i 's/implementation(libs.firebase.analytics)//' android/app/build.gradle.kts
 
       - name: Setup Go
         uses: actions/setup-go@v5
