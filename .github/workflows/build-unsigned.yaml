@@ -39,6 +39,14 @@ jobs:
           sed -i 's/implementation(libs.firebase.crashlytics.ndk)//' android/app/build.gradle.kts
           sed -i 's/implementation(libs.firebase.analytics)//' android/app/build.gradle.kts
 
+      # Free up disk space on the runner (Go builds consume a lot)
+      - name: Free disk space
+        if: startsWith(matrix.platform,'android')
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/.cache /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/Ruby /opt/hostedtoolcache/go/*/go/pkg
+          df -h /
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -73,7 +81,8 @@ jobs:
         run: dart setup.dart ${{ matrix.platform }} -v
         shell: bash
         env:
-          ANDROID_ARCH: ""
+          ANDROID_ARCH: "${{ matrix.platform == 'android' && 'arm64' || '' }}"
+          GOCACHE: /tmp/go-cache
 
       - name: Upload
         uses: actions/upload-artifact@v4
